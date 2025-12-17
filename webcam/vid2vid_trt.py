@@ -72,10 +72,11 @@ class Pipeline:
 
     def accept_new_params(self, params: "Pipeline.InputParams"):
         if hasattr(params, "image"):
-            image_pil = params.image.to(self.device).float() / 255.0
-            image_pil = image_pil * 2. - 1. 
-            image_pil = image_pil.permute(2, 0, 1).unsqueeze(0)
-            self.input_queue.put(image_pil)
+            # Keep on CPU for multiprocessing queue transfer
+            image_tensor = params.image.float() / 255.0
+            image_tensor = image_tensor * 2. - 1.
+            image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0)
+            self.input_queue.put(image_tensor)
 
         if hasattr(params, "restart") and params.restart:
             self.restart_event.set()
@@ -109,32 +110,113 @@ class Pipeline:
         print("Pipeline closed successfully")
 
 def generate_process(
-        config_path, 
-        prepare_event, 
-        restart_event, 
-        stop_event, 
-        input_queue, 
-        output_queue, 
+        config_path,
+        prepare_event,
+        restart_event,
+        stop_event,
+        input_queue,
+        output_queue,
         reference_queue,
-        device): 
+        device):
+    import os
+    # Enable synchronous CUDA errors for better debugging
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
     torch.set_grad_enabled(False)
+
+    # Initialize CUDA context in this process
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+        # Force CUDA initialization by allocating a small tensor
+        _ = torch.zeros(1, device=device)
+        print(f"CUDA initialized in worker process on device: {device}")
+
     pipeline = PersonaLive(config_path, device)
+
+    # After TensorRT initialization, ensure PyTorch CUDA context is active
+    if device.type == 'cuda':
+        print("Testing PyTorch CUDA context after TensorRT initialization...")
+        try:
+            torch.cuda.set_device(device)
+            torch.cuda.synchronize()
+            # Test that PyTorch CUDA works
+            test_tensor = torch.randn(1, 3, 64, 64, device=device)
+            print(f"  Created test tensor on {test_tensor.device}")
+            test_resized = torch.nn.functional.interpolate(test_tensor, size=(32, 32), mode='bilinear')
+            print(f"  Interpolation successful: {test_resized.shape}")
+            print(f"✓ PyTorch CUDA context validated successfully")
+            del test_tensor, test_resized
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"✗ PyTorch CUDA validation FAILED: {e}")
+            print("  This indicates TensorRT initialization corrupted PyTorch's CUDA context")
+            import traceback
+            traceback.print_exc()
+            raise
     chunk_size = 4
-    
+
     prepare_event.set()
 
+    # Wait for initial reference image
     reference_img = reference_queue.get()
     pipeline.fuse_reference(reference_img)
+    print('Initial reference fused')
 
-    print('fuse reference done')
-    
     while not stop_event.is_set():
+        # Check if there's a new reference image to fuse
+        if not reference_queue.empty():
+            try:
+                new_reference = reference_queue.get_nowait()
+                print('New reference image detected, fusing...')
+                pipeline.fuse_reference(new_reference)
+                print('New reference fused successfully')
+            except Exception as e:
+                print(f'Failed to get new reference: {e}')
+
         if restart_event.is_set():
             clear_queue(input_queue)
             restart_event.clear()
         images = read_images_from_queue(input_queue, chunk_size, device, stop_event)
-        images = torch.cat(images, dim=0)
-        
-        video = pipeline.process_input(images)
+        if images is None:
+            continue
+
+        try:
+            # Concatenate on CPU first
+            images = torch.cat(images, dim=0)
+            # Ensure contiguous memory layout
+            images = images.contiguous()
+
+            # Debug before GPU transfer
+            print(f"Before GPU transfer - Shape: {images.shape}, dtype: {images.dtype}, device: {images.device}")
+            print(f"  Data range check - min: {images.min().item():.4f}, max: {images.max().item():.4f}")
+            print(f"  Has NaN: {torch.isnan(images).any().item()}, Has Inf: {torch.isinf(images).any().item()}")
+
+            # Move to GPU with explicit synchronization
+            images = images.to(device, non_blocking=False)
+            torch.cuda.synchronize()
+
+            print(f"After GPU transfer - Shape: {images.shape}, dtype: {images.dtype}, device: {images.device}")
+
+            video = pipeline.process_input(images)
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                print(f"CUDA Error encountered: {e}")
+                print("CUDA context may be corrupted. Attempting recovery...")
+                # Try to reset CUDA context
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                # If still failing, break the loop to prevent infinite errors
+                print("Stopping processing loop due to persistent CUDA errors")
+                break
+            else:
+                print(f"Error processing images: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        except Exception as e:
+            print(f"Unexpected error processing images: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
         for image in video:
             output_queue.put(image)

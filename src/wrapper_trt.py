@@ -33,15 +33,26 @@ def log_tensor_info(name, tensor):
     if tensor is None:
         logging.info(f"Tensor '{name}': None")
         return
-    
-    info_str = (
-        f"Tensor '{name}': "
-        f"Shape={tensor.shape}, "
-        f"Dtype={tensor.dtype}, "
-        f"Device={tensor.device}, "
-        f"Min={tensor.min().item():.4f}, "
-        f"Max={tensor.max().item():.4f}"
-    )
+
+    try:
+        min_val = tensor.min().item()
+        max_val = tensor.max().item()
+        info_str = (
+            f"Tensor '{name}': "
+            f"Shape={tensor.shape}, "
+            f"Dtype={tensor.dtype}, "
+            f"Device={tensor.device}, "
+            f"Min={min_val:.4f}, "
+            f"Max={max_val:.4f}"
+        )
+    except Exception as e:
+        info_str = (
+            f"Tensor '{name}': "
+            f"Shape={tensor.shape}, "
+            f"Dtype={tensor.dtype}, "
+            f"Device={tensor.device}, "
+            f"[Error getting min/max: {e}]"
+        )
     logging.info(info_str)
 
 
@@ -171,13 +182,27 @@ class PersonaLive:
         self.reference_unet.enable_xformers_memory_efficient_attention()
 
     def fast_resize(self, images, target_width, target_height) -> torch.Tensor:
-        tgt_cond_tensor = F.interpolate(
-            images,
-            size=(target_width, target_height),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return tgt_cond_tensor
+        # Ensure tensor is valid before interpolation
+        logging.info(f"fast_resize input - shape: {images.shape}, dtype: {images.dtype}, device: {images.device}")
+        logging.info(f"fast_resize - is_contiguous: {images.is_contiguous()}")
+
+        # Make sure we're using the right CUDA device
+        if images.device.type == 'cuda':
+            torch.cuda.set_device(images.device)
+
+        try:
+            tgt_cond_tensor = F.interpolate(
+                images,
+                size=(target_width, target_height),
+                mode="bilinear",
+                align_corners=False,
+            )
+            logging.info(f"fast_resize output - shape: {tgt_cond_tensor.shape}")
+            return tgt_cond_tensor
+        except Exception as e:
+            logging.error(f"Error in fast_resize: {e}")
+            logging.error(f"Input tensor info: shape={images.shape}, dtype={images.dtype}, device={images.device}")
+            raise
 
     @torch.no_grad()
     def fuse_reference(self, ref_image):  # pil input

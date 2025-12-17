@@ -1,11 +1,15 @@
-import tensorrt as trt 
+import tensorrt as trt
 import pycuda.driver as cuda
-import pycuda.autoinit
+# DO NOT import pycuda.autoinit - it conflicts with PyTorch's CUDA context
+# import pycuda.autoinit
 import numpy as np
 import torch
 import traceback
 import os
 from PIL import Image
+
+# Initialize pycuda manually to use PyTorch's CUDA context
+cuda.init()
 
 TRT_LOGGER = trt.Logger()
 SKIP_ENGINE_MODEL_CHECK = True
@@ -52,13 +56,37 @@ def match_dtype(a, b):
 
 
 class EngineModel:
+    def _safe_pop_context(self):
+        """Only pop context if we created it (not using primary context)"""
+        if not self.using_primary_context:
+            self.ctx.pop()
+
     def __init__(self, engine_file_path, stream = None, device_int = 0, extra_lock = None):
         self.device_int = device_int
         self.extra_lock = extra_lock
         if not(self.extra_lock is None):
             self.extra_lock.acquire()
         assert os.path.exists(engine_file_path), "Engine model path not exists!"
-        self.ctx = cuda.Device(self.device_int).make_context()
+
+        # Use PyTorch's existing CUDA context instead of creating a new one
+        # This prevents conflicts between pycuda and PyTorch
+        print(f"[EngineModel] Using PyTorch's CUDA context for device {device_int}")
+
+        # Get the current CUDA context from PyTorch
+        # If PyTorch already initialized CUDA, we attach to that context
+        # Otherwise, create a context that won't conflict
+        self.using_primary_context = False
+        try:
+            # Try to get PyTorch's primary context
+            self.ctx = cuda.Device(self.device_int).retain_primary_context()
+            self.ctx.push()  # Activate the context
+            self.using_primary_context = True
+            print(f"[EngineModel] Using PyTorch's primary CUDA context")
+        except Exception as e:
+            # Fallback to making a context (but this may cause issues)
+            print(f"[EngineModel] Warning: retain_primary_context failed ({e}), creating new context")
+            self.ctx = cuda.Device(self.device_int).make_context()
+            self.using_primary_context = False
         try:
             self.engine = get_engine(engine_file_path) # 载入TensorRT引擎
             input_nvars = 0
@@ -125,9 +153,9 @@ class EngineModel:
                 ) for name in self.output_names
             } # 分配 page-locked host 内存以存储输出
         except:
-            self.ctx.pop()
+            self._safe_pop_context()
             raise Exception("CUDA Initialization Failed!")
-        self.ctx.pop()
+        self._safe_pop_context()
         if not(self.extra_lock is None):
             self.extra_lock.release()
 
@@ -171,11 +199,11 @@ class EngineModel:
         except Exception as e:
             print("TensorRT Execution Failed!")
             traceback.print_exc()
-            self.ctx.pop()
+            self._safe_pop_context()
             if not(self.extra_lock is None):
                 self.extra_lock.release()
             return None
-        self.ctx.pop()
+        self._safe_pop_context()
         if not(self.extra_lock is None):
             self.extra_lock.release()
         return r
@@ -214,11 +242,11 @@ class EngineModel:
             self.stream.synchronize()
         except Exception as e:
             traceback.print_exc()
-            self.ctx.pop()
+            self._safe_pop_context()
             if not(self.extra_lock is None):
                 self.extra_lock.release()
             return False
-        self.ctx.pop()
+        self._safe_pop_context()
         if not(self.extra_lock is None):
             self.extra_lock.release()
         return True
@@ -252,11 +280,11 @@ class EngineModel:
                 self.context.set_tensor_address(target, int(other.doutputs[source]))
         except Exception as e:
             traceback.print_exc()
-            self.ctx.pop()
+            self._safe_pop_context()
             if not(self.extra_lock is None):
                 self.extra_lock.release()
             return False
-        self.ctx.pop()
+        self._safe_pop_context()
         if not(self.extra_lock is None):
             self.extra_lock.release()
         return True
@@ -279,11 +307,11 @@ class EngineModel:
                 self.context.set_tensor_address(target, int(self.doutputs[source]))
         except Exception as e:
             traceback.print_exc()
-            self.ctx.pop()
+            self._safe_pop_context()
             if not(self.extra_lock is None):
                 self.extra_lock.release()
             return False
-        self.ctx.pop()
+        self._safe_pop_context()
         if not(self.extra_lock is None):
             self.extra_lock.release()
         return True
@@ -297,11 +325,11 @@ class EngineModel:
             for name in self.input_names:
                 self.context.set_tensor_address(name, int(self.dinputs[name]))
         except:
-            self.ctx.pop()
+            self._safe_pop_context()
             if not(self.extra_lock is None):
                 self.extra_lock.release()
             return False
-        self.ctx.pop()
+        self._safe_pop_context()
         if not(self.extra_lock is None):
             self.extra_lock.release()
         return True

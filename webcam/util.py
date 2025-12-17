@@ -29,8 +29,10 @@ def bytes_to_pil(image_bytes: bytes) -> Image.Image:
 def bytes_to_tensor(image_bytes):
     image = Image.open(io.BytesIO(image_bytes))
     np_img = np.asarray(image)
+    # Make a writable copy to avoid PyTorch warning
+    np_img = np.copy(np_img)
     tensor = torch.from_numpy(np_img)
-    
+
     # nparr = np.frombuffer(image_bytes, np.uint8)
     # img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)  # BGR
     # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
